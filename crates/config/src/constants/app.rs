@@ -62,8 +62,8 @@ pub const DEFAULT_CONSOLE_ENABLE: bool = true;
 /// Default OBS configuration endpoint
 /// Environment variable: DEFAULT_OBS_ENDPOINT
 /// Command line argument: --obs-endpoint
-/// Example: DEFAULT_OBS_ENDPOINT="http://localost:4317"
-/// Example: --obs-endpoint http://localost:4317
+/// Example: DEFAULT_OBS_ENDPOINT="http://localost:4318"
+/// Example: --obs-endpoint http://localost:4318
 pub const DEFAULT_OBS_ENDPOINT: &str = "";
 
 /// Default TLS key for rustfs
@@ -97,6 +97,12 @@ pub const RUSTFS_HTTP_PREFIX: &str = "http://";
 /// It is used to identify HTTPS URLs.
 /// Default value: https://
 pub const RUSTFS_HTTPS_PREFIX: &str = "https://";
+
+/// Environment variable for rustfs address
+/// This is the environment variable for rustfs address.
+/// It is used to bind the server to a specific address.
+/// Example: RUSTFS_ADDRESS=":9000"
+pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
 
 /// Default port for rustfs
 /// This is the default port for rustfs.

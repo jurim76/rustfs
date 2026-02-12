@@ -33,13 +33,15 @@ path = "src/main.rs"
 [features]
 default = ["metrics"]
 metrics = []
+ftps = ["rustfs-protocols/ftps"]
+full = ["metrics", "ftps"]
 
 [lints]
 workspace = true
 
 [dependencies]
 # RustFS Internal Crates
-rustfs-ahm = { workspace = true }
+rustfs-heal = { workspace = true }
 rustfs-appauth = { workspace = true }
 rustfs-audit = { workspace = true }
 rustfs-common = { workspace = true }
@@ -51,16 +53,20 @@ rustfs-iam = { workspace = true }
 rustfs-kms = { workspace = true }
 rustfs-lock.workspace = true
 rustfs-madmin = { workspace = true }
+rustfs-metrics = { workspace = true }
 rustfs-notify = { workspace = true }
 rustfs-obs = { workspace = true }
 rustfs-policy = { workspace = true }
+rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio.workspace = true
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
 rustfs-targets = { workspace = true }
+rustfs-trusted-proxies = { workspace = true }
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-zip = { workspace = true }
+rustfs-scanner = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
@@ -95,9 +101,7 @@ serde_urlencoded = { workspace = true }
 rustls = { workspace = true }
 subtle = { workspace = true }
 rustls-pemfile = { workspace = true }
-
-# Time and Date
-chrono = { workspace = true }
+jiff = { workspace = true }
 time = { workspace = true, features = ["parsing", "formatting", "serde"] }
 
 # Utilities and Tools
@@ -126,21 +130,26 @@ urlencoding = { workspace = true }
 uuid = { workspace = true }
 zip = { workspace = true }
 libc = { workspace = true }
+rand = { workspace = true }
+aes-gcm = { workspace = true }
 
 # Observability and Metrics
 metrics = { workspace = true }
-
-# FTP and SFTP Libraries
-libunftp = { workspace = true }
-russh = { workspace = true }
-russh-sftp = { workspace = true }
-ssh-key = { workspace = true }
+opentelemetry = { workspace = true }
+tracing-opentelemetry = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 
 [target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 mimalloc = { workspace = true }
+
+# Only enable pprof-based profiling on non-Windows targets.
+[target.'cfg(all(not(target_os = "windows"), not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))'.dependencies]
+starshard = { workspace = true }
+backtrace = { workspace = true }
+rand = { workspace = true }
+pprof = { workspace = true }
 
 [target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
 tikv-jemallocator = { workspace = true }
@@ -151,6 +160,11 @@ pprof = { workspace = true }
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }
+tempfile = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 
 [build-dependencies]
 http.workspace = true

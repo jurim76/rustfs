@@ -33,10 +33,12 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use metrics::{counter, histogram};
+use opentelemetry::global;
 use rustfs_common::GlobalReadiness;
 use rustfs_config::{RUSTFS_TLS_CERT, RUSTFS_TLS_KEY};
 use rustfs_ecstore::rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
+use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
 use rustls::ServerConfig;
 use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
@@ -55,6 +57,7 @@ use tower_http::compression::CompressionLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing::{Span, debug, error, info, instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 pub async fn start_http_server(
     opt: &config::Opt,
@@ -96,21 +99,35 @@ pub async fn start_http_server(
 
         // Common setup for both IPv4 and successful dual-stack IPv6
         let backlog = get_listen_backlog();
-        socket.set_reuse_address(true)?;
-        // Set the socket to non-blocking before passing it to Tokio.
-        socket.set_nonblocking(true)?;
-
-        // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
-        socket.set_tcp_nodelay(true)?;
-
-        // 3. Set system-level TCP KeepAlive to protect long connections
-        // Note: This sets keepalive on the LISTENING socket, which is inherited by accepted sockets on some platforms (e.g. Linux).
-        // However, we also explicitly set it on accepted sockets in the loop below to be safe and cross-platform.
         let keepalive = get_default_tcp_keepalive();
-        socket.set_tcp_keepalive(&keepalive)?;
 
-        // 4. Increase receive buffer to support BDP at GB-level throughput
-        socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
+        // Helper to configure socket with optimized parameters
+        let configure_socket = |socket: &socket2::Socket| -> Result<()> {
+            socket.set_reuse_address(true)?;
+
+            // Set the socket to non-blocking before passing it to Tokio.
+            socket.set_nonblocking(true)?;
+
+            // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
+            socket.set_tcp_nodelay(true)?;
+
+            // 2. Enable SO_REUSEPORT for better multi-core scalability on supported platforms
+            #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+            if let Err(e) = socket.set_reuse_port(true) {
+                debug!("Failed to set SO_REUSEPORT: {}", e);
+            }
+
+            // 3. Set system-level TCP KeepAlive to protect long connections
+            socket.set_tcp_keepalive(&keepalive)?;
+
+            // 4. Increase receive/send buffer to support BDP at GB-level throughput
+            socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
+            socket.set_send_buffer_size(4 * rustfs_config::MI_B)?;
+
+            Ok(())
+        };
+
+        configure_socket(&socket)?;
 
         // Attempt bind; if bind fails for IPv6, try IPv4 fallback once more.
         if let Err(bind_err) = socket.bind(&server_addr.into()) {
@@ -120,13 +137,8 @@ pub async fn start_http_server(
                 let ipv4_addr = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), server_addr.port());
                 server_addr = ipv4_addr;
                 socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
-                socket.set_reuse_address(true)?;
-                socket.set_nonblocking(true)?;
-                socket.set_tcp_nodelay(true)?;
-                socket.set_tcp_keepalive(&keepalive)?;
-                socket.set_recv_buffer_size(4 * rustfs_config::MI_B)?;
+                configure_socket(&socket)?;
                 socket.bind(&server_addr.into())?;
-                // [FIX] Ensure fallback socket is moved to listening state as well.
                 socket.listen(backlog)?;
             } else {
                 return Err(bind_err);
@@ -160,7 +172,7 @@ pub async fn start_http_server(
     // Detailed endpoint information (showing all API endpoints)
     let api_endpoints = format!("{protocol}://{local_ip_str}:{server_port}");
     let localhost_endpoint = format!("{protocol}://127.0.0.1:{server_port}");
-    let now_time = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let now_time = jiff::Zoned::now().strftime("%Y-%m-%d %H:%M:%S").to_string();
     if opt.console_enable {
         admin::console::init_console_cfg(local_ip, server_port);
 
@@ -207,7 +219,7 @@ pub async fn start_http_server(
         b.set_access(store.clone());
         b.set_route(admin::make_admin_route(opt.console_enable)?);
 
-        // console server does not need to setup virtual-hosted-style requests
+        // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
         if !opt.server_domains.is_empty() && !opt.console_enable {
             MultiDomain::new(&opt.server_domains).map_err(Error::other)?; // validate domains
 
@@ -261,9 +273,10 @@ pub async fn start_http_server(
         };
 
         // RustFS Transport Layer Configuration Constants - Optimized for S3 Workloads
-        const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 2; // 2MB: Optimize large file throughput
-        const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 1024 * 1024 * 4; // 4MB: Link-level flow control
-        const H2_MAX_FRAME_SIZE: u32 = 16384; // 16KB: Reduce framing overhead
+        const H2_INITIAL_STREAM_WINDOW_SIZE: u32 = 1024 * 1024 * 4; // 4MB: Optimize large file throughput
+        const H2_INITIAL_CONN_WINDOW_SIZE: u32 = 1024 * 1024 * 8; // 8MB: Link-level flow control
+        const H2_MAX_FRAME_SIZE: u32 = 512 * 1024; // 512KB: Reduce framing overhead for large objects
+        const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024; // 64KB: Conservative header limit to mitigate DoS risk
 
         let mut conn_builder = ConnBuilder::new(TokioExecutor::new());
 
@@ -280,10 +293,12 @@ pub async fn start_http_server(
         conn_builder
             .http2()
             .timer(TokioTimer::new())
+            .adaptive_window(true)
             .initial_stream_window_size(H2_INITIAL_STREAM_WINDOW_SIZE)
             .initial_connection_window_size(H2_INITIAL_CONN_WINDOW_SIZE)
             .max_frame_size(H2_MAX_FRAME_SIZE)
             .max_concurrent_streams(Some(2048))
+            .max_header_list_size(H2_MAX_HEADER_LIST_SIZE)
             .keep_alive_interval(Some(Duration::from_secs(20)))
             .keep_alive_timeout(Duration::from_secs(10));
 
@@ -363,12 +378,18 @@ pub async fn start_http_server(
                 warn!(?err, "Failed to set TCP_KEEPALIVE");
             }
 
-            // 1. Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
+            // Disable Nagle algorithm: Critical for 4KB Payload, achieving ultra-low latency
             if let Err(err) = socket_ref.set_tcp_nodelay(true) {
                 warn!(?err, "Failed to set TCP_NODELAY");
             }
 
-            // 4. Increase receive buffer to support BDP at GB-level throughput
+            // Enable TCP QuickAck to reduce latency for small requests
+            #[cfg(target_os = "linux")]
+            if let Err(err) = socket_ref.set_tcp_quickack(true) {
+                debug!(?err, "Failed to set TCP_QUICKACK");
+            }
+
+            // Increase receive/send buffer to support BDP at GB-level throughput
             if let Err(err) = socket_ref.set_recv_buffer_size(4 * rustfs_config::MI_B) {
                 warn!(?err, "Failed to set set_recv_buffer_size");
             }
@@ -447,6 +468,9 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
+        // Enable session resumption to reduce handshake overhead for returning clients
+        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
+
         // Log SNI requests
         if rustfs_utils::tls_key_log() {
             server_config.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -478,6 +502,9 @@ async fn setup_tls_acceptor(tls_path: &str) -> Result<Option<TlsAcceptor>> {
         // Configure ALPN protocol priority
         server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec(), b"http/1.0".to_vec()];
 
+        // Enable session resumption to reduce handshake overhead for returning clients
+        server_config.session_storage = rustls::server::ServerSessionMemoryCache::new(10000);
+
         // Log SNI requests
         if rustfs_utils::tls_key_log() {
             server_config.key_log = Arc::new(rustls::KeyLogFile::new());
@@ -499,9 +526,43 @@ struct ConnectionContext {
     readiness: Arc<GlobalReadiness>,
 }
 
+/// Adapter that implements the OpenTelemetry [`Extractor`] trait for Hyper's
+/// [`HeaderMap`], enabling trace context propagation by extracting
+/// OpenTelemetry headers from incoming HTTP requests.
+pub struct HeaderMapCarrier<'a> {
+    headers: &'a HeaderMap,
+}
+
+impl<'a> HeaderMapCarrier<'a> {
+    pub fn new(headers: &'a HeaderMap) -> Self {
+        Self { headers }
+    }
+}
+
+impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.headers.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.headers.keys().map(|k| k.as_str()).collect()
+    }
+
+    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
+        let headers = self
+            .headers
+            .get_all(key)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+
+        if headers.is_empty() { None } else { Some(headers) }
+    }
+}
+
 /// Process a single incoming TCP connection.
 ///
-/// This function is executed in a new Tokio task and it will:
+/// This function is executed in a new Tokio task, and it will:
 /// 1. If TLS is configured, perform TLS handshake.
 /// 2. Build a complete service stack for this connection, including S3, RPC services, and all middleware.
 /// 3. Use Hyper to handle HTTP requests on this connection.
@@ -538,11 +599,24 @@ fn process_connection(
                 None
             }
         };
-
         let hybrid_service = ServiceBuilder::new()
+            // NOTE: Both extension types are intentionally inserted to maintain compatibility:
+            // 1. `Option<RemoteAddr>` - Used by existing admin/storage handlers throughout the codebase
+            // 2. `std::net::SocketAddr` - Required by TrustedProxyMiddleware for proxy validation
+            // This dual insertion is necessary because the middleware expects the raw SocketAddr type
+            // while our application code uses the RemoteAddr wrapper. Consolidating these would
+            // require either modifying the third-party middleware or refactoring all existing handlers.
+            .layer(AddExtensionLayer::new(remote_addr))
+            .option_layer(remote_addr.map(|ra| AddExtensionLayer::new(ra.0)))
+            // Add TrustedProxyLayer to handle X-Forwarded-For and other proxy headers
+            // This should be placed before TraceLayer so that logs reflect the real client IP
+            .option_layer(if rustfs_trusted_proxies::is_enabled() {
+                Some(rustfs_trusted_proxies::layer().clone())
+            } else {
+                None
+            })
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(CatchPanicLayer::new())
-            .layer(AddExtensionLayer::new(remote_addr))
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
             .layer(ReadinessGateLayer::new(readiness))
@@ -554,13 +628,28 @@ fn process_connection(
                             .get(http::header::HeaderName::from_static("x-request-id"))
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("unknown");
+
+                        let parent_context = global::get_text_map_propagator(|propagator| {
+                            propagator.extract(&HeaderMapCarrier::new(request.headers()))
+                        });
+
+                        // Extract real client IP from trusted proxy middleware if available
+                        let client_info = request.extensions().get::<ClientInfo>();
+                        let real_ip = client_info
+                            .map(|info| info.real_ip.to_string())
+                            .unwrap_or_else(|| "unknown".to_string());
+
                         let span = tracing::info_span!("http-request",
                             trace_id = %trace_id,
                             status_code = tracing::field::Empty,
                             method = %request.method(),
+                            real_ip = %real_ip,
                             uri = %request.uri(),
                             version = ?request.version(),
                         );
+                        if let Err(e) = span.set_parent(parent_context) {
+                            warn!("Failed to propagate tracing context: `{:?}`", e);
+                        }
                         for (header_name, header_value) in request.headers() {
                             if header_name == "user-agent" || header_name == "content-type" || header_name == "content-length" {
                                 span.record(header_name.as_str(), header_value.to_str().unwrap_or("invalid"));
@@ -749,7 +838,7 @@ fn get_listen_backlog() -> i32 {
     #[cfg(any(target_os = "macos", target_os = "freebsd"))]
     let mut name = [libc::CTL_KERN, libc::KERN_IPC, libc::KIPC_SOMAXCONN];
     let mut buf = [0; 1];
-    let mut buf_len = std::mem::size_of_val(&buf);
+    let mut buf_len = size_of_val(&buf);
 
     if unsafe {
         libc::sysctl(
@@ -787,5 +876,86 @@ fn get_default_tcp_keepalive() -> TcpKeepalive {
             .with_time(Duration::from_secs(60))
             .with_interval(Duration::from_secs(5))
             .with_retries(3)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::HeaderMap;
+    use opentelemetry::propagation::Extractor;
+
+    #[test]
+    fn test_headermap_carrier_new() {
+        let headers = HeaderMap::new();
+        let carrier = HeaderMapCarrier::new(&headers);
+        assert_eq!(carrier.keys().len(), 0);
+    }
+
+    #[test]
+    fn test_headermap_carrier_get() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "test-agent".parse().unwrap());
+        headers.insert("x-request-id", "12345".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+
+        assert_eq!(carrier.get("user-agent"), Some("test-agent"));
+        assert_eq!(carrier.get("x-request-id"), Some("12345"));
+        assert_eq!(carrier.get("content-type"), None);
+    }
+
+    #[test]
+    fn test_headermap_carrier_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", "test-agent".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+        let keys = carrier.keys();
+
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&"user-agent"));
+        assert!(keys.contains(&"content-type"));
+    }
+
+    #[test]
+    fn test_headermap_carrier_get_all() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-custom-header", "value1".parse().unwrap());
+        headers.append("x-custom-header", "value2".parse().unwrap());
+        headers.insert("user-agent", "test-agent".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+
+        // Test multi-value header
+        let values = carrier.get_all("x-custom-header");
+        assert!(values.is_some());
+        let v = values.unwrap();
+        assert_eq!(v.len(), 2);
+        assert!(v.contains(&"value1"));
+        assert!(v.contains(&"value2"));
+
+        // Test single value header
+        let values = carrier.get_all("user-agent");
+        assert!(values.is_some());
+        let v = values.unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0], "test-agent");
+
+        // Test missing header
+        assert_eq!(carrier.get_all("missing-header"), None);
+    }
+
+    #[test]
+    fn test_headermap_carrier_case_insensitivity() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let carrier = HeaderMapCarrier::new(&headers);
+
+        // HeaderMap::get is case insensitive
+        assert_eq!(carrier.get("Content-Type"), Some("application/json"));
+        assert_eq!(carrier.get("CONTENT-TYPE"), Some("application/json"));
     }
 }

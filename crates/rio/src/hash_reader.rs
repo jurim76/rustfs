@@ -240,7 +240,7 @@ impl HashReader {
                     let er = EtagReader::new(inner, md5hex.clone());
                     inner = Box::new(er);
                 }
-            } else if !diskable_md5 {
+            } else if size != Self::SIZE_PRESERVE_LAYER && !diskable_md5 {
                 let er = EtagReader::new(inner, md5hex.clone());
                 inner = Box::new(er);
             }
@@ -562,6 +562,7 @@ impl TryGetIndex for HashReader {
 mod tests {
     use super::*;
     use crate::{DecryptReader, WarpReader, encrypt_reader};
+    use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
 
@@ -656,7 +657,6 @@ mod tests {
         use crate::{CompressReader, DecompressReader};
         use md5::{Digest, Md5};
         use rand::Rng;
-        use rand::RngCore;
         use rustfs_utils::compress::CompressionAlgorithm;
 
         // Generate 1MB random data

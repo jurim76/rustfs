@@ -281,7 +281,7 @@ impl ReplicationState {
                     return repl_status;
                 }
             }
-        } else if self.replica_status != ReplicationStatusType::default() {
+        } else if !self.replica_status.is_empty() {
             return self.replica_status.clone();
         }
 
@@ -708,7 +708,7 @@ pub fn parse_replicate_decision(_bucket: &str, s: &str) -> std::io::Result<Repli
     // }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplicateObjectInfo {
     pub name: String,
     pub size: i64,
